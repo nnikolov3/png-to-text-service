@@ -33,6 +33,8 @@ lint:
 	@gofmt -w -s .
 	@go vet ./...
 	@golangci-lint run --fix ./...
+	@golangci-lint cache clean
+	@go clean -cache
 
 
 

@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/nnikolov3/configurator"
+	"github.com/book-expert/configurator"
+	"github.com/book-expert/logger"
 )
 
 // Constants for default values and permissions.
@@ -40,27 +42,54 @@ const (
 
 // Pre-defined errors for configuration validation.
 var (
-	// ErrInputDirRequired is returned when the input directory path is missing.
-	ErrInputDirRequired = errors.New("paths.input_dir is required")
-	// ErrOutputDirRequired is returned when the output directory path is missing.
-	ErrOutputDirRequired = errors.New("paths.output_dir is required")
-	// ErrAPIKeyVarRequired is returned when the API key variable is required but not
-	// set.
 	ErrAPIKeyVarRequired = errors.New(
 		"gemini.api_key_variable is required when augmentation is enabled",
 	)
+	ErrTTSVoiceRequired = errors.New("png_to_text_service.tts_defaults.voice is required")
 )
+
+// NATSConfig holds all NATS and JetStream settings.
+type NATSConfig struct {
+	URL                      string `toml:"url"`
+	PDFStreamName            string `toml:"pdf_stream_name"`
+	PDFConsumerName          string `toml:"pdf_consumer_name"`
+	PDFCreatedSubject        string `toml:"pdf_created_subject"`
+	PDFObjectStoreBucket     string `toml:"pdf_object_store_bucket"`
+	PNGStreamName            string `toml:"png_stream_name"`
+	PNGConsumerName          string `toml:"png_consumer_name"`
+	PNGCreatedSubject        string `toml:"png_created_subject"`
+	PNGObjectStoreBucket     string `toml:"png_object_store_bucket"`
+	TextStreamName           string `toml:"text_stream_name"`
+	TextObjectStoreBucket    string `toml:"text_object_store_bucket"`
+	TTSStreamName            string `toml:"tts_stream_name"`
+	TTSConsumerName          string `toml:"tts_consumer_name"`
+	TextProcessedSubject     string `toml:"text_processed_subject"`
+	AudioChunkCreatedSubject string `toml:"audio_chunk_created_subject"`
+	AudioObjectStoreBucket   string `toml:"audio_object_store_bucket"`
+	DeadLetterSubject        string `toml:"dead_letter_subject"`
+}
+
+// PathsConfig holds common path configurations.
+type PathsConfig struct {
+	BaseLogsDir string `toml:"base_logs_dir"`
+}
+
+// PNGToTextServiceConfig holds all settings specific to this service.
+type PNGToTextServiceConfig struct {
+	Tesseract    Tesseract    `toml:"tesseract"`
+	Gemini       Gemini       `toml:"gemini"`
+	Logging      Logging      `toml:"logging"`
+	Augmentation Augmentation `toml:"augmentation"`
+	Prompts      Prompts      `toml:"prompts"`
+	TTSDefaults  TTSDefaults  `toml:"tts_defaults"`
+}
 
 // Config represents the complete, validated configuration for the service.
 type Config struct {
-	Project      Project      `toml:"project"`
-	Paths        Paths        `toml:"paths"`
-	Prompts      Prompts      `toml:"prompts"`
-	Augmentation Augmentation `toml:"augmentation"`
-	Logging      Logging      `toml:"logging"`
-	Tesseract    Tesseract    `toml:"tesseract"`
-	Gemini       Gemini       `toml:"gemini"`
-	Settings     Settings     `toml:"settings"`
+	Project          Project                `toml:"project"`
+	NATS             NATSConfig             `toml:"nats"`
+	Paths            PathsConfig            `toml:"paths"`
+	PNGToTextService PNGToTextServiceConfig `toml:"png_to_text_service"`
 }
 
 // Project contains project metadata.
@@ -70,12 +99,6 @@ type Project struct {
 	Description string `toml:"description"`
 }
 
-// Paths contains input and output directory paths.
-type Paths struct {
-	InputDir  string `toml:"input_dir"`
-	OutputDir string `toml:"output_dir"`
-}
-
 // Prompts contains AI prompts used for augmentation.
 type Prompts struct {
 	Augmentation string `toml:"augmentation"`
@@ -83,9 +106,10 @@ type Prompts struct {
 
 // Augmentation defines settings for AI text augmentation.
 type Augmentation struct {
-	Type             string `toml:"type"`
-	CustomPrompt     string `toml:"custom_prompt"`
-	UsePromptBuilder bool   `toml:"use_prompt_builder"`
+	Type             string         `toml:"type"`
+	CustomPrompt     string         `toml:"custom_prompt"`
+	UsePromptBuilder bool           `toml:"use_prompt_builder"`
+	Parameters       map[string]any `toml:"parameters"`
 }
 
 // Logging defines the configuration for logging.
@@ -118,25 +142,36 @@ type Gemini struct {
 	MaxTokens         int      `toml:"max_tokens"`
 }
 
-// Settings contains general processing settings for the service.
-type Settings struct {
-	Workers            int  `toml:"workers"`
-	TimeoutSeconds     int  `toml:"timeout_seconds"`
-	EnableAugmentation bool `toml:"enable_augmentation"`
-	SkipExisting       bool `toml:"skip_existing"`
+// TTSDefaults holds default text-to-speech parameters that will be propagated to downstream services.
+type TTSDefaults struct {
+	Voice             string  `toml:"voice"`
+	Seed              int     `toml:"seed"`
+	NGL               int     `toml:"ngl"`
+	TopP              float64 `toml:"top_p"`
+	RepetitionPenalty float64 `toml:"repetition_penalty"`
+	Temperature       float64 `toml:"temperature"`
 }
 
-// Load reads, validates, and sets defaults for the configuration from a given path.
-func Load(configPath string) (*Config, error) {
+// Load reads, validates, and sets defaults for the configuration.
+// If a configPath is provided, it sets the PROJECT_TOML env var for the configurator to
+// use.
+// Otherwise, it relies on the existing environment variable.
+func Load(configPath string, log *logger.Logger) (*Config, error) {
+	if configPath != "" {
+		err := os.Setenv("PROJECT_TOML", configPath)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"failed to set PROJECT_TOML env var for test: %w",
+				err,
+			)
+		}
+	}
+
 	var cfg Config
 
-	err := configurator.LoadInto(configPath, &cfg)
+	err := configurator.Load(&cfg, log)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"failed to load configuration from %s: %w",
-			configPath,
-			err,
-		)
+		return nil, fmt.Errorf("failed to load configuration: %w", err)
 	}
 
 	err = cfg.validate()
@@ -147,76 +182,52 @@ func Load(configPath string) (*Config, error) {
 	return &cfg, nil
 }
 
-// FindProjectRoot searches upwards from a starting directory to find a "project.toml"
-// file, returning the project's root directory and the full path to the config file.
-func FindProjectRoot(startDir string) (rootDir, configPath string, err error) {
-	rootDir, configPath, err = configurator.FindProjectRoot(startDir)
-	if err != nil {
-		return "", "", fmt.Errorf(
-			"failed to find project root from %s: %w",
-			startDir,
-			err,
-		)
-	}
-
-	return rootDir, configPath, nil
-}
-
 // GetAPIKey retrieves the Gemini API key from the environment variable specified
-// in the configuration. It returns an empty string if the variable is not set.
+// in the configuration.
 func (c *Config) GetAPIKey() string {
-	if c.Gemini.APIKeyVariable == "" {
+	if c.PNGToTextService.Gemini.APIKeyVariable == "" {
 		return ""
 	}
 
-	return os.Getenv(c.Gemini.APIKeyVariable)
+	return os.Getenv(c.PNGToTextService.Gemini.APIKeyVariable)
 }
 
-// EnsureDirectories creates the input, output, and logging directories if they
-// do not already exist, using the permissions defined by defaultDirPermission.
+// EnsureDirectories creates the logging directory if it does not already exist.
 func (c *Config) EnsureDirectories() error {
-	dirs := []string{c.Paths.InputDir, c.Paths.OutputDir, c.Logging.Dir}
-	for _, dir := range dirs {
-		err := os.MkdirAll(dir, defaultDirPermission)
-		if err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", dir, err)
-		}
+	logDir := c.PNGToTextService.Logging.Dir
+	if logDir == "" {
+		logDir = c.Paths.BaseLogsDir
+	}
+
+	err := os.MkdirAll(logDir, defaultDirPermission)
+	if err != nil {
+		return fmt.Errorf("failed to create log directory %s: %w", logDir, err)
 	}
 
 	return nil
 }
 
-// GetLogFilePath constructs the full path for a given log filename inside the
-// configured logging directory.
+// GetLogFilePath constructs the full path for a given log filename.
 func (c *Config) GetLogFilePath(filename string) string {
-	return filepath.Join(c.Logging.Dir, filename)
+	logDir := c.PNGToTextService.Logging.Dir
+	if logDir == "" {
+		logDir = c.Paths.BaseLogsDir
+	}
+
+	return filepath.Join(logDir, filename)
 }
 
 // validate runs all validation and default-setting routines for the configuration.
 func (c *Config) validate() error {
-	err := c.validateRequiredFields()
-	if err != nil {
-		return err
-	}
-
 	c.applyDefaults()
 
-	err = c.validateGeminiSettings()
-	if err != nil {
-		return err
+	if c.PNGToTextService.Augmentation.UsePromptBuilder &&
+		c.PNGToTextService.Gemini.APIKeyVariable == "" {
+		return ErrAPIKeyVarRequired
 	}
 
-	return nil
-}
-
-// validateRequiredFields checks for the presence of essential configuration values.
-func (c *Config) validateRequiredFields() error {
-	if c.Paths.InputDir == "" {
-		return ErrInputDirRequired
-	}
-
-	if c.Paths.OutputDir == "" {
-		return ErrOutputDirRequired
+	if strings.TrimSpace(c.PNGToTextService.TTSDefaults.Voice) == "" {
+		return ErrTTSVoiceRequired
 	}
 
 	return nil
@@ -224,52 +235,55 @@ func (c *Config) validateRequiredFields() error {
 
 // applyDefaults sets default values for various configuration sections.
 func (c *Config) applyDefaults() {
-	// Settings defaults
-	if c.Settings.Workers <= 0 {
-		c.Settings.Workers = 4
-	}
-
-	if c.Settings.TimeoutSeconds <= 0 {
-		c.Settings.TimeoutSeconds = 300
-	}
-
 	// Tesseract defaults
-	setStringDefault(&c.Tesseract.Language, "eng")
-	setIntDefault(&c.Tesseract.OEM, defaultTesseractOEM)
-	setIntDefault(&c.Tesseract.PSM, defaultTesseractPSM)
-	setIntDefault(&c.Tesseract.DPI, defaultTesseractDPI)
-	setIntDefault(&c.Tesseract.TimeoutSeconds, defaultTesseractTimeoutSeconds)
+	setStringDefault(&c.PNGToTextService.Tesseract.Language, "eng")
+	setIntDefault(&c.PNGToTextService.Tesseract.OEM, defaultTesseractOEM)
+	setIntDefault(&c.PNGToTextService.Tesseract.PSM, defaultTesseractPSM)
+	setIntDefault(&c.PNGToTextService.Tesseract.DPI, defaultTesseractDPI)
+	setIntDefault(
+		&c.PNGToTextService.Tesseract.TimeoutSeconds,
+		defaultTesseractTimeoutSeconds,
+	)
 
 	// Augmentation defaults
-	setStringDefault(&c.Augmentation.Type, "commentary")
+	setStringDefault(&c.PNGToTextService.Augmentation.Type, "commentary")
 
 	// Logging defaults
-	setStringDefault(&c.Logging.Level, "info")
-	setStringDefault(&c.Logging.Dir, "./logs")
-}
+	setStringDefault(&c.PNGToTextService.Logging.Level, "info")
 
-// validateGeminiSettings checks Gemini settings only if augmentation is enabled
-// and applies defaults where necessary.
-func (c *Config) validateGeminiSettings() error {
-	if !c.Settings.EnableAugmentation {
-		return nil
+	if c.PNGToTextService.Logging.Dir == "" {
+		c.PNGToTextService.Logging.Dir = c.Paths.BaseLogsDir
 	}
 
-	if c.Gemini.APIKeyVariable == "" {
-		return ErrAPIKeyVarRequired
+	// Gemini defaults
+	if len(c.PNGToTextService.Gemini.Models) == 0 {
+		c.PNGToTextService.Gemini.Models = []string{"gemini-1.5-flash"}
 	}
 
-	// Gemini defaults (only applied if augmentation is enabled)
-	if len(c.Gemini.Models) == 0 {
-		c.Gemini.Models = []string{"gemini-1.5-flash"}
+	setIntDefault(&c.PNGToTextService.Gemini.MaxRetries, defaultGeminiMaxRetries)
+	setIntDefault(
+		&c.PNGToTextService.Gemini.RetryDelaySeconds,
+		defaultGeminiRetryDelaySeconds,
+	)
+	setIntDefault(
+		&c.PNGToTextService.Gemini.TimeoutSeconds,
+		defaultGeminiTimeoutSeconds,
+	)
+	setIntDefault(&c.PNGToTextService.Gemini.MaxTokens, defaultGeminiMaxTokens)
+
+	setStringDefault(&c.PNGToTextService.TTSDefaults.Voice, "default")
+
+	if c.PNGToTextService.TTSDefaults.TopP <= 0 {
+		c.PNGToTextService.TTSDefaults.TopP = 0.95
 	}
 
-	setIntDefault(&c.Gemini.MaxRetries, defaultGeminiMaxRetries)
-	setIntDefault(&c.Gemini.RetryDelaySeconds, defaultGeminiRetryDelaySeconds)
-	setIntDefault(&c.Gemini.TimeoutSeconds, defaultGeminiTimeoutSeconds)
-	setIntDefault(&c.Gemini.MaxTokens, defaultGeminiMaxTokens)
+	if c.PNGToTextService.TTSDefaults.RepetitionPenalty < 1.0 {
+		c.PNGToTextService.TTSDefaults.RepetitionPenalty = 1.0
+	}
 
-	return nil
+	if c.PNGToTextService.TTSDefaults.Temperature <= 0 {
+		c.PNGToTextService.TTSDefaults.Temperature = 0.7
+	}
 }
 
 // setStringDefault sets a default string value if the target field is empty.
